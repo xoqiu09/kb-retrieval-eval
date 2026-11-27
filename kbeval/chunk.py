@@ -3,7 +3,10 @@ from dataclasses import dataclass
 import re
 
 
-_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+([^\r\n]*)|(?=\r?$))", re.MULTILINE)
+_HEADING_OR_FENCE = re.compile(
+    r"^ {0,3}(?:(#{1,6})(?:[ \t]+([^\r\n]*)|(?=\r?$))|(?P<fence>`{3,}|~{3,})(?P<info>[^\r\n]*))",
+    re.MULTILINE,
+)
 
 
 @dataclass(frozen=True)
@@ -22,7 +25,17 @@ class Chunk:
 def _headings(text: str) -> list[tuple[int, tuple[str, ...]]]:
     headings = [(0, ())]
     stack: list[tuple[int, str]] = []
-    for match in _HEADING.finditer(text):
+    fence = None
+    for match in _HEADING_OR_FENCE.finditer(text):
+        marker, info = match.group("fence", "info")
+        if fence:
+            if marker and marker[0] == fence[0] and len(marker) >= len(fence) and not info.strip(" \t"):
+                fence = None
+            continue
+        if marker:
+            if marker[0] == "~" or "`" not in info:
+                fence = marker
+            continue
         level = len(match[1])
         title = re.sub(r"(?:^|[ \t]+)#+[ \t]*$", "", match[2] or "").strip()
         while stack and stack[-1][0] >= level:

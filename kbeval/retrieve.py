@@ -7,7 +7,17 @@ from .chunk import Chunk
 
 _CHINESE = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U000323af"
 _RUNS = re.compile(rf"[{_CHINESE}]+|[a-z0-9]+")
+DEFAULT_EXPANSION_WEIGHT = 0.5
 Ranked = list[tuple[Chunk, float]]
+
+
+def expand_query(question: str, synonyms: dict[str, list[str]]) -> str:
+    question = question.lower()
+    return " ".join(
+        phrase for wording, phrases in synonyms.items()
+        if wording.lower() in question
+        for phrase in phrases
+    )
 
 
 def _bigrams(run: str):
@@ -44,12 +54,14 @@ class BM25:
             for term, frequency in frequencies.items()
         }
 
-    def rank(self, question: str) -> Ranked:
-        terms = sorted(set(bm25_terms(question)) & self.idf.keys())
+    def rank(self, question: str, *, expansion: str = "", expansion_weight: float = DEFAULT_EXPANSION_WEIGHT) -> Ranked:
+        weights = dict.fromkeys(bm25_terms(expansion), expansion_weight)
+        weights.update(dict.fromkeys(bm25_terms(question), 1))
+        terms = sorted(weights.keys() & self.idf.keys())
         scored = []
         for chunk, counts, length_norm in zip(self.chunks, self.counts, self.length_norms):
             score = sum(
-                self.idf[term] * counts[term] * (self.k1 + 1) / (counts[term] + length_norm)
+                self.idf[term] * counts[term] * (self.k1 + 1) / (counts[term] + length_norm) * weights[term]
                 for term in terms
                 if counts[term]
             )
@@ -66,6 +78,11 @@ class BigramOverlap:
         self.chunks = chunks
         self.terms = [_bigram_set(chunk.text) for chunk in chunks]
 
-    def rank(self, question: str) -> Ranked:
+    def rank(self, question: str, *, expansion: str = "", expansion_weight: float = DEFAULT_EXPANSION_WEIGHT) -> Ranked:
         query = _bigram_set(question)
-        return _rank([(chunk, len(query & terms)) for chunk, terms in zip(self.chunks, self.terms)])
+        added = _bigram_set(expansion) - query
+        scored = []
+        for chunk, terms in zip(self.chunks, self.terms):
+            bonus = expansion_weight * len(added & terms) if added else 0
+            scored.append((chunk, len(query & terms) + bonus))
+        return _rank(scored)
