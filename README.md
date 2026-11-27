@@ -1,8 +1,37 @@
 # 知识库检索评测
 
-这对找工作有什么用：面试时可以现场跑一组客服知识库问题，展示你怎样测检索、定位失败，再用数据选择切块和检索设置。
+客服团队调整知识库搜索后，需要知道坐席能否找到正确的退换货或保修条款，以及哪些问题变得更难查。
 
-青柚家电的 6 篇知识库文档和 40 道问题均为虚构。每道题用文档里的完整原句作标准答案。切块方式一变，程序重新检查每个块是否完整包含原句。每个命中块都能追溯到文档名、标题路径和原文范围。
+- 用带标准原句的客服问题，对比文档分段和搜索方法。
+- 看哪种设置更常找到正确段落，逐题列出哪些变好、哪些变差。
+- 解释为什么漏掉答案，并标出搜索结果在原文中的位置。
+
+## 怎么验证的
+
+运行 `python3 -m unittest`，29 项全部通过。测试用手算核对命中率和排名指标，也验证分段重叠能找回被切断的答案。
+
+在隔离副本里故意取消分段重叠、改错排名公式、让 BM25 忽略段落长度，对应测试都按预期失败。
+
+## 快速运行
+
+[在线演示](https://xoqiu.cn/retrieval-demo/index.html) · [GitHub 仓库](https://github.com/xoqiu09/kb-retrieval-eval)
+
+克隆后在仓库根目录运行。第一条生成评测报告，第二条解释一道漏检。
+
+```sh
+python3 -m kbeval eval --out ./retrieval-report.json
+python3 -m kbeval explain Q07 --config fixed-200-0/bm25/3
+```
+
+数据全是虚构的，未接入真实模型，也没有真实用户参与。我负责设定需求和验收标准，指导 AI 编程工具实现。
+
+## English overview
+
+Support teams need to know whether search returns the policy text their agents need.\
+The tool compares document splitting and search methods on fictional support questions.\
+It shows which questions improve or regress, explains misses, and links results to the source text.\
+All 14 tests passed on the public version. Deliberate code changes triggered the expected test failures.\
+I set the requirements and acceptance criteria and directed AI coding tools to build it. No live model or real users were involved.
 
 ## 怎么运行
 
@@ -21,10 +50,9 @@ python3 -m kbeval eval --out /tmp/kbeval-w19p1-b.json
 python3 -m kbeval compare /tmp/kbeval-w19p1-a.json /tmp/kbeval-w19p1-b.json
 ```
 
-查看 Q07 的检索结果。第一条命令显示原句被切断，第二条显示加 50 字重叠后完整原句回到结果里。配置写作 `切块/检索器/k`，取值分别为 `heading`、`fixed-200-0`、`fixed-200-50`，`bm25`、`bigram`，以及 `1`、`3`、`5`。
+[快速运行](#快速运行)中的 Q07 示例显示原句被切断。改用下面的配置保留 50 字重叠，完整原句会回到结果里。配置写作 `切块/检索器/k`，取值分别为 `heading`、`fixed-200-0`、`fixed-200-50`，`bm25`、`bigram`，以及 `1`、`3`、`5`。
 
 ```sh
-python3 -m kbeval explain Q07 --config fixed-200-0/bm25/3
 python3 -m kbeval explain Q07 --config fixed-200-50/bm25/3
 ```
 
@@ -45,7 +73,7 @@ python3 -m unittest -v
 - 标题切块以 Markdown 的 `#` 系列标题为边界。定长切块按 200 个 Unicode 字符滑动，标题路径取块起点处的路径。位置从 0 开始，含起点、不含终点。
 - BM25 用中文单字和相邻两字作为词，英文和数字串转小写后按整词计分。二元组检索数问题和块共有的不同相邻字符对。两者都对所有块打分，包括零分块。同分按文档名和块起点排序。
 - 每道题取第一个完整包含原句的块。Recall@k 是它出现在前 k 名的题所占比例。MRR 是所有题的倒数排名平均值，排名取自全部结果，无完整块的题计 0。靠后命中指排第 2 至第 k 名的题。
-- 未命中时依次检查原句是否被切断，问题与原句用 BM25 的词表规则分词后是否毫无重合，以及含原句的块是否排在前 k 名之外。第二类列出两组词，第三类列出排在首个含原句块之前的块。
+- 未命中时先检查有没有块完整包含原句。没有就归为“答案被切断”。如果首个含原句的块排在前 k 名之外，按 BM25 的分词规则检查问题与原句的词是否重合。词没有重合就列出两组词，否则列出排在首个含原句块之前的块。
 - 先比 Recall@3，再比 MRR，最后选块数较少的设置。三项都相同时按矩阵顺序取第一项。`heading/bigram/3` 和 `fixed-200-50/bm25/3` 都命中 39/40 题，前者的 MRR 为 0.97708，后者为 0.97667，因此推荐前者。推荐只适用于这组虚构数据。
 
 ## 每项测试证明什么
@@ -68,7 +96,3 @@ python3 -m unittest -v
 ## 本里程碑的范围
 
 只评测检索。未接入真实模型和向量库，未做网页或答案生成。网站演示页可以另行读取导出的 JSON。
-
-## English overview
-
-This offline demo evaluates knowledge-base retrieval on six fictional support articles and forty questions. It compares heading-based and fixed-width chunks with BM25 and character-bigram overlap at k=1, 3, and 5. Use the commands above to evaluate, compare reports, explain individual misses, and export deterministic JSON. The recommendation applies to the bundled corpus.

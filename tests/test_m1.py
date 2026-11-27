@@ -1,13 +1,16 @@
+from io import StringIO
 from math import log
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
-from kbeval.__main__ import load_data, make_chunks, query_result
+from kbeval.__main__ import explain, export_has_path, json_strings, load_data, main, make_chunks, query_result
 from kbeval.chunk import Chunk, by_heading, fixed_width, gold_chunks
 from kbeval.metrics import summarize
 from kbeval.retrieve import BM25
@@ -15,23 +18,10 @@ from kbeval.retrieve import BM25
 
 ROOT = Path(__file__).resolve().parents[1]
 PRIVATE_TEXT = re.compile(
-    r"(?<![A-Za-z0-9_./\\~-])(?:/+|~[/\\]|[A-Za-z]:[/\\]|\\\\)[^\s/\\]"
-    r"|[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}"
+    r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}"
     r"|(?<![0-9])1[3-9][0-9]{9}(?![0-9])"
     r"|-----BEGIN .*PRIVATE KEY-----"
 )
-
-
-def json_strings(value):
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        yield from value
-        for field in value.values():
-            yield from json_strings(field)
-    elif isinstance(value, list):
-        for item in value:
-            yield from json_strings(item)
 
 
 def cli(*args: str) -> str:
@@ -56,6 +46,18 @@ class ChunkTests(unittest.TestCase):
         for chunk in chunks:
             self.assertEqual(chunk.document, "manual.md")
             self.assertEqual(chunk.text, text[chunk.start:chunk.end])
+
+    def test_chunk_titles_ignore_headings_inside_fenced_code(self):
+        for opening, closing in (("~~~", "~~~"), ("````python\n```", "````")):
+            with self.subTest(opening=opening):
+                text = f"# 手册\n{opening}\n# 这是示例\n{closing}\n后续正文。\n"
+                expected = Chunk("manual.md", ("手册",), 0, len(text), text)
+                self.assertEqual(by_heading("manual.md", text), [expected])
+
+                extended = text + "## 附录\n附录正文。\n"
+                chunks = fixed_width("manual.md", extended, len(text), 0)
+                self.assertEqual(chunks[0], expected)
+                self.assertEqual(chunks[1].title_path, ("手册", "附录"))
 
     def test_fixed_windows_keep_exact_overlap_and_tail(self):
         text = "# 总览\n" + "甲" * 135 + "\n## 细则\n" + "乙" * 325 + "终"
@@ -129,6 +131,49 @@ class CommandTests(unittest.TestCase):
         cli("eval", "--out", str(cls.baseline))
         cls.report = json.loads(cls.baseline.read_bytes())
 
+    def test_load_data_rejects_partial_gold_sentence(self):
+        data = self.directory / "partial-gold"
+        shutil.copytree(ROOT / "data", data)
+        questions_file = data / "questions.jsonl"
+        questions = [json.loads(line) for line in questions_file.read_text(encoding="utf-8").splitlines()]
+        question = next(item for item in questions if item["id"] == "Q34")
+        for gold in ("保留", "保留七天。"):
+            with self.subTest(gold=gold):
+                question["gold"] = gold
+                questions_file.write_text("\n".join(map(json.dumps, questions)), encoding="utf-8")
+                with patch("kbeval.__main__.DATA", data):
+                    with self.assertRaisesRegex(ValueError, "标准原句：Q34"):
+                        load_data()
+
+    def test_load_data_checks_the_full_sentence_across_a_soft_line_break(self):
+        data = self.directory / "wrapped-gold"
+        shutil.copytree(ROOT / "data", data)
+        doc = data / "kb" / "account.md"
+        original = doc.read_text(encoding="utf-8")
+        questions_file = data / "questions.jsonl"
+        questions = [json.loads(line) for line in questions_file.read_text(encoding="utf-8").splitlines()]
+        question = next(item for item in questions if item["id"] == "Q34")
+        original_gold = question["gold"]
+        cases = (
+            ("\n", "云端日志仅\n保留七天。", True),
+            ("\n", "保留七天。", False),
+            ("\n\n", "保留七天。", True),
+        )
+        for gap, gold, valid in cases:
+            with self.subTest(gap=gap, gold=gold):
+                wrapped = f"云端日志仅{gap}保留七天。"
+                doc.write_text(original.replace(original_gold, wrapped), encoding="utf-8")
+                question["gold"] = gold
+                questions_file.write_text("\n".join(map(json.dumps, questions)), encoding="utf-8")
+                with patch("kbeval.__main__.DATA", data):
+                    if valid:
+                        documents, loaded = load_data()
+                        self.assertIn(question, loaded)
+                        self.assertTrue(gold_chunks(make_chunks(documents, "heading"), gold))
+                    else:
+                        with self.assertRaisesRegex(ValueError, "标准原句：Q34"):
+                            load_data()
+
     def test_eval_matrix_and_gold_are_independent_of_retriever(self):
         documents, questions = load_data()
         self.assertEqual(len(documents), 6)
@@ -198,6 +243,23 @@ class CommandTests(unittest.TestCase):
             "2 格，共 10 项逐题对比：变好 2，变坏 2，不变 6。",
         ])
 
+    def test_compare_rejects_question_missing_from_both_configs(self):
+        config = "heading/bigram/3"
+        report = json.loads(self.baseline.read_bytes())
+        del report["configs"][config]["results"]["Q34"]
+        left = self.directory / "missing-before.json"
+        right = self.directory / "missing-after.json"
+        left.write_text(json.dumps(report), encoding="utf-8")
+        report["configs"]["heading/bm25/1"]["results"]["Q01"]["rank"] = None
+        right.write_text(json.dumps(report), encoding="utf-8")
+
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            cli("compare", str(left), str(right))
+        self.assertEqual(caught.exception.returncode, 2)
+        self.assertEqual(caught.exception.stdout, "")
+        self.assertIn(config, caught.exception.stderr)
+        self.assertIn("Q34", caught.exception.stderr)
+
     def test_compare_rejects_changed_question_or_gold(self):
         right = self.directory / "changed-question.json"
         for field in ("question", "gold"):
@@ -236,6 +298,18 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(ahead[0], row["top"][0]["chunk"])
         self.assertIn(f"排在首个含原句块之前的块：{', '.join(ahead)}", displaced)
 
+    def test_explain_reports_zero_score_tie_at_cutoff(self):
+        documents = {"b.md": "水杯。", "a.md": "奶茶。"}
+        question = {"id": "Q01", "question": "水箱", "gold": "水杯。"}
+        with patch("sys.stdout", new_callable=StringIO) as stdout:
+            explain(documents, question, "heading/bigram/1")
+
+        output = stdout.getvalue()
+        self.assertIn("1. a.md", output)
+        self.assertIn("首个含标准原句的块排第 2 名。", output)
+        self.assertIn("归因：同分，按文件名和块起点排序", output)
+        self.assertIn("第 1 名与首个含原句块得分相同：0.0000", output)
+
     def test_export_is_stable_and_uses_only_public_corpus_sources(self):
         first, second = (self.directory / name for name in ("demo.json", "demo-again.json"))
         cli("export", "--out", str(first))
@@ -255,6 +329,53 @@ class CommandTests(unittest.TestCase):
                 del chunk["text"]
         self.assertEqual(export, self.report)
 
+    def test_export_allows_slash_in_prose_and_public_urls(self):
+        data = self.directory / "public-demo-corpus"
+        shutil.copytree(ROOT / "data", data)
+        doc = data / "kb" / "smart.md"
+        original = doc.read_text(encoding="utf-8") + "\n"
+        url_host = "https://support.example.com"
+        padding = " " * (-(len(original) + len(url_host)) % 200)
+        cases = ("请查看配送/安装说明。", f"请看[帮助]({url_host}/help)。", f"{padding}{url_host}/help")
+        for index, text in enumerate(cases):
+            with self.subTest(text=text.strip()):
+                doc.write_text(original + text + "\n", encoding="utf-8")
+                output = self.directory / f"public-demo-{index}.json"
+                with (
+                    patch("kbeval.__main__.DATA", data),
+                    patch("sys.argv", ["kbeval", "export", "--out", str(output)]),
+                    patch("sys.stdout", new_callable=StringIO),
+                ):
+                    main()
+                chunks = json.loads(output.read_bytes())["chunks"]["heading"].values()
+                self.assertTrue(any(text.strip() in chunk["text"] for chunk in chunks))
+
+    def test_export_rejects_absolute_path_before_writing(self):
+        data = self.directory / "path-in-corpus"
+        shutil.copytree(ROOT / "data", data)
+        doc = data / "kb" / "smart.md"
+        original = doc.read_text(encoding="utf-8")
+        cases = (
+            "见 `/tmp/demo.md`。", "见/tmp/demo.md。", "示例 `cc -I/tmp/demo/include`。",
+            "见~/demo/手册.md。", r"见C:\Users\demo\manual.md。",
+        )
+        for index, text in enumerate(cases):
+            with self.subTest(text=text):
+                doc.write_text(f"{original}\n{text}\n", encoding="utf-8")
+                output = self.directory / f"path-in-demo-{index}.json"
+                with (
+                    patch("kbeval.__main__.DATA", data),
+                    patch("sys.argv", ["kbeval", "export", "--out", str(output)]),
+                    patch("sys.stdout", new_callable=StringIO) as stdout,
+                    patch("sys.stderr", new_callable=StringIO) as stderr,
+                ):
+                    with self.assertRaises(SystemExit) as caught:
+                        main()
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("绝对路径", stderr.getvalue())
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertFalse(output.exists())
+
     def test_export_privacy_check_rejects_paths_and_phones_in_prose(self):
         for text in ("详见 `/tmp/demo.md`。", "请联系13900000000确认。"):
             with self.subTest(text=text):
@@ -263,6 +384,7 @@ class CommandTests(unittest.TestCase):
                     self.assert_export_has_no_private_text(payload)
 
     def assert_export_has_no_private_text(self, export):
+        self.assertFalse(export_has_path(export), "发现路径或隐私信息")
         for value in json_strings(export):
             self.assertNotIn(str(ROOT), value)
             self.assertNotIn(str(self.directory), value)
