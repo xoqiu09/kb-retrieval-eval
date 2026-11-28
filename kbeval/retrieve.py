@@ -69,18 +69,18 @@ class BM25:
         return _rank(scored)
 
 
-def _bigram_set(text: str) -> set[str]:
+def bigram_set(text: str) -> set[str]:
     return {pair for run in _RUNS.findall(text.lower()) for pair in _bigrams(run)}
 
 
 class BigramOverlap:
     def __init__(self, chunks: list[Chunk]):
         self.chunks = chunks
-        self.terms = [_bigram_set(chunk.text) for chunk in chunks]
+        self.terms = [bigram_set(chunk.text) for chunk in chunks]
 
     def rank(self, question: str, *, expansion: str = "", expansion_weight: float = DEFAULT_EXPANSION_WEIGHT) -> Ranked:
-        query = _bigram_set(question)
-        added = _bigram_set(expansion) - query
+        query = bigram_set(question)
+        added = bigram_set(expansion) - query
         scored = []
         for chunk, terms in zip(self.chunks, self.terms):
             bonus = expansion_weight * len(added & terms) if added else 0

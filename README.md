@@ -8,7 +8,7 @@
 
 ## 怎么验证的
 
-运行 `python3 -m unittest`，38 项全部通过。测试用手算核对命中率和排名指标，也验证分段重叠能找回被切断的答案。
+运行 `python3 -m unittest`，40 项全部通过。测试用手算核对命中率和排名指标，也验证分段重叠能找回被切断的答案。
 
 在隔离副本里故意取消分段重叠、改错排名公式、让 BM25 忽略段落长度，对应测试都按预期失败。
 
@@ -32,7 +32,7 @@ python3 -m kbeval explain Q07 --config fixed-200-0/bm25/3
 Support teams need to know whether search returns the policy text their agents need.\
 The tool compares document splitting and search methods on fictional support questions.\
 It shows which questions improve or regress, explains misses, and links results to the source text.\
-All 38 tests pass on the current version. Deliberate code changes triggered the expected test failures.\
+All 40 tests pass on the current version. Deliberate code changes triggered the expected test failures.\
 I set the requirements and acceptance criteria and directed AI coding tools to build it. No live model or real users were involved.
 
 ## 怎么运行
@@ -75,7 +75,7 @@ python3 -m unittest -v
 - 标题切块以 Markdown 的 `#` 系列标题为边界。定长切块按 200 个 Unicode 字符滑动，标题路径取块起点处的路径。位置从 0 开始，含起点、不含终点。
 - BM25 用中文单字和相邻两字作为词，英文和数字串转小写后按整词计分。二元组检索数问题和块共有的不同相邻字符对。两者都对所有块打分，包括零分块。同分按文档名和块起点排序。
 - 每道题取第一个完整包含原句的块。Recall@k 是它出现在前 k 名的题所占比例。MRR 是所有题的倒数排名平均值，排名取自全部结果，无完整块的题计 0。靠后命中指排第 2 至第 k 名的题。
-- 未命中时先检查有没有块完整包含原句。没有就归为“答案被切断”。如果首个含原句的块排在前 k 名之外，按 BM25 的分词规则检查问题与原句的词是否重合。词没有重合就列出两组词，否则列出排在首个含原句块之前的块。
+- 未命中时先检查有没有块完整包含原句。没有就归为“答案被切断”。如果首个含原句的块排在前 k 名之外，且得分低于第 k 名，就按当前检索器的规则检查问题与原句是否重合，BM25 用分词，bigram 用相邻字符对。没有重合就列出两组词或字符对，有重合就列出排在首个含原句块之前的块。
 - 先比 Recall@3，再比 MRR，最后选块数较少的设置。三项都相同时按矩阵顺序取第一项。`heading/bigram/3` 和 `fixed-200-50/bm25/3` 都命中 39/40 题，前者的 MRR 为 0.97708，后者为 0.97667，因此推荐前者。推荐只适用于这组虚构数据。
 
 ## 每项测试证明什么
