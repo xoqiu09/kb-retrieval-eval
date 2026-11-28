@@ -15,7 +15,7 @@ from kbeval.__main__ import (
 )
 from kbeval.chunk import Chunk, by_heading, fixed_width, gold_chunks
 from kbeval.metrics import summarize
-from kbeval.retrieve import BM25
+from kbeval.retrieve import BM25, BigramOverlap
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -336,6 +336,33 @@ class CommandTests(unittest.TestCase):
             "2 格，共 10 项逐题对比：变好 2，变坏 2，不变 6。",
         ])
 
+    def test_compare_validates_result_and_rank_before_printing(self):
+        config, qid = "heading/bigram/1", "Q01"
+        report = json.loads(self.baseline.read_bytes())
+        results = report["configs"][config]["results"]
+        self.assertEqual(results[qid]["rank"], 1)
+        right = self.directory / "changed-result.json"
+
+        for row, message in (
+            ({"rank": 0.5}, "名次无效，须为正整数或 null"),
+            (None, "结果须为 JSON 对象"),
+            ([], "结果须为 JSON 对象"),
+        ):
+            with self.subTest(row=row):
+                results[qid] = row
+                right.write_text(json.dumps(report), encoding="utf-8")
+                with self.assertRaises(subprocess.CalledProcessError) as caught:
+                    cli("compare", str(self.baseline), str(right))
+                error = caught.exception
+                self.assertEqual(error.returncode, 2, error.stderr)
+                self.assertEqual(error.stdout, "")
+                self.assertIn(f"{config} 的 {qid} {message}", error.stderr)
+                self.assertNotIn("Traceback", error.stderr)
+
+        results[qid] = {"rank": None}
+        right.write_text(json.dumps(report), encoding="utf-8")
+        self.assertIn("变好 0，变坏 1，不变 719。", cli("compare", str(self.baseline), str(right)))
+
     def test_compare_rejects_question_missing_from_both_configs(self):
         config = "heading/bigram/3"
         report = json.loads(self.baseline.read_bytes())
@@ -402,6 +429,23 @@ class CommandTests(unittest.TestCase):
         self.assertIn("首个含标准原句的块排第 2 名。", output)
         self.assertIn("归因：同分，按文件名和块起点排序", output)
         self.assertIn("第 1 名与首个含原句块得分相同：0.0000", output)
+
+    def test_explain_bigram_miss_lists_higher_scoring_chunk(self):
+        documents = {"a.md": "Refunds 是栏目名。", "b.md": "可申请 refund。"}
+        question = {"id": "Q01", "question": "refunds?", "gold": documents["b.md"]}
+        chunks = make_chunks(documents, "heading")
+        ranking = BigramOverlap(chunks).rank(question["question"])
+        self.assertEqual([(chunk.id, score) for chunk, score in ranking], [
+            ("a.md:0-13", 6), ("b.md:0-11", 5),
+        ])
+
+        with patch("sys.stdout", new_callable=StringIO) as stdout:
+            explain(documents, question, "heading/bigram/1")
+
+        output = stdout.getvalue()
+        self.assertIn("首个含标准原句的块排第 2 名。", output)
+        self.assertIn("归因：被相似段落挤掉", output)
+        self.assertIn("排在首个含原句块之前的块：a.md:0-13", output)
 
     def test_export_is_stable_and_uses_only_public_corpus_sources(self):
         first, second = (self.directory / name for name in ("demo.json", "demo-again.json"))

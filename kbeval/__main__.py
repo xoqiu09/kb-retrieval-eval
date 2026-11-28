@@ -130,12 +130,15 @@ def make_chunks(documents: dict[str, str], chunking: str) -> list[Chunk]:
     return chunks
 
 
-def query_result(record: dict[str, str], ranked: Ranked, gold_ids: set[str], k: int, *, expansion: str = "") -> dict:
+def query_result(
+    record: dict[str, str], ranked: Ranked, gold_ids: set[str], k: int, *,
+    retriever: str = "bm25", expansion: str = "",
+) -> dict:
     rank = next((index for index, (chunk, _) in enumerate(ranked, 1) if chunk.id in gold_ids), None)
     diagnosis = None
     if rank is None or rank > k:
         question = f"{record['question']} {expansion}" if expansion else record["question"]
-        diagnosis = explain_miss(question, record["gold"], ranked, rank, k)
+        diagnosis = explain_miss(question, record["gold"], ranked, rank, k, retriever=retriever)
         if expansion and rank is not None and rank > k + 1 and "ahead" not in diagnosis:
             diagnosis["ahead"] = [chunk.id for chunk, _ in ranked[:rank - 1]]
     return {
@@ -189,6 +192,7 @@ def build_report(
                         results = {
                             item["id"]: query_result(
                                 item, rankings[item["id"]], matches[item["id"]], k,
+                                retriever=retriever,
                                 expansion=expansions[item["id"]] if expansion_weight else "",
                             )
                             for item in records
@@ -248,12 +252,19 @@ def export_has_private_text(report: dict) -> bool:
     return any(_EXPORT_PRIVATE_TEXT.search(value) for value in json_strings(report))
 
 
-def validate_result_ids(name: str, expected_ids: set[str], *results: dict) -> None:
+def validate_results(name: str, expected_ids: set[str], *results: dict) -> None:
     different_ids = set()
     for result in results:
         different_ids.update(result.keys() ^ expected_ids)
     if different_ids:
         raise ValueError(f"{name} 的结果与题目清单不符：{', '.join(sorted(different_ids))}")
+    for result in results:
+        for qid, row in result.items():
+            if not isinstance(row, dict):
+                raise ValueError(f"{name} 的 {qid} 结果须为 JSON 对象")
+            rank = row.get("rank")
+            if "rank" not in row or (rank is not None and (type(rank) is not int or rank <= 0)):
+                raise ValueError(f"{name} 的 {qid} 名次无效，须为正整数或 null")
 
 
 def validate_comparison(left: dict, right: dict) -> None:
@@ -273,7 +284,7 @@ def validate_comparison(left: dict, right: dict) -> None:
     expected_ids = set(left_questions)
     for name, before in left["configs"].items():
         after = right["configs"][name]
-        validate_result_ids(name, expected_ids, before["results"], after["results"])
+        validate_results(name, expected_ids, before["results"], after["results"])
 
 
 def compare_reports(left: dict, right: dict) -> None:
@@ -348,7 +359,7 @@ def compare_expansion(report: dict) -> None:
     for _, dataset in datasets:
         expected_ids = {item["id"] for item in dataset["questions"]}
         for name in ALL_CONFIGS:
-            validate_result_ids(name, expected_ids, dataset["configs"][name]["results"])
+            validate_results(name, expected_ids, dataset["configs"][name]["results"])
 
     print(f"同义词扩展关闭 → 开启（权重 {report['expansion_weight']:g}）")
     for label, dataset in datasets:
@@ -367,7 +378,7 @@ def explain(documents: dict[str, str], record: dict[str, str], config: str) -> N
     lookup = {chunk.id: chunk for chunk in chunks}
     ranked = RETRIEVERS[retriever](chunks).rank(record["question"])
     spans = _sentence_spans(documents).get(record["gold"], {})
-    result = query_result(record, ranked, gold_chunks(chunks, spans), k)
+    result = query_result(record, ranked, gold_chunks(chunks, spans), k, retriever=retriever)
     print(f"{record['id']}｜{config}｜{record['question']}")
     print(f"标准原句：{record['gold']}")
     for pos, hit in enumerate(result["top"], 1):
