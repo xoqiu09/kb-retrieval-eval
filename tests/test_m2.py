@@ -289,3 +289,29 @@ class ExpansionCommandTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, 2)
                 self.assertIn("同义词条目“遥测档案”的值应为文本列表", stderr.getvalue())
                 self.assertFalse(output.exists())
+
+    def test_eval_rejects_blank_synonym_keys_before_scoring(self):
+        data = self.directory / "blank-synonym-keys"
+        copytree(ROOT / "data", data)
+        synonyms_path = data / "kb" / "synonyms.json"
+        synonyms = json.loads(synonyms_path.read_bytes())
+
+        for index, wording in enumerate(("", " \t　")):
+            with self.subTest(wording=wording):
+                output = self.directory / f"blank-synonym-key-{index}.json"
+                argv = ["kbeval", "eval", "--expand", "--out", str(output)]
+                synonyms_path.write_text(json.dumps(synonyms | {wording: ["云端日志"]}), encoding="utf-8")
+                with (
+                    patch("kbeval.__main__.DATA", data),
+                    patch("kbeval.__main__.build_report", wraps=build_report) as score,
+                    patch("sys.argv", argv),
+                    patch("sys.stdout", new_callable=StringIO) as stdout,
+                    patch("sys.stderr", new_callable=StringIO) as stderr,
+                ):
+                    with self.assertRaises(SystemExit) as caught:
+                        main()
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("同义词条目名称为空", stderr.getvalue())
+                score.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertFalse(output.exists())

@@ -75,5 +75,8 @@ def fixed_width(document: str, text: str, size: int, overlap: int) -> list[Chunk
     return chunks
 
 
-def gold_chunks(chunks: list[Chunk], gold: str) -> set[str]:
-    return {chunk.id for chunk in chunks if gold in chunk.text}
+def gold_chunks(chunks: list[Chunk], spans: dict[str, list[tuple[int, int]]]) -> set[str]:
+    return {
+        chunk.id for chunk in chunks
+        if any(chunk.start <= start and end <= chunk.end for start, end in spans.get(chunk.document, ()))
+    }

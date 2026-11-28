@@ -8,7 +8,7 @@
 
 ## 怎么验证的
 
-运行 `python3 -m unittest`，35 项全部通过。测试用手算核对命中率和排名指标，也验证分段重叠能找回被切断的答案。
+运行 `python3 -m unittest`，38 项全部通过。测试用手算核对命中率和排名指标，也验证分段重叠能找回被切断的答案。
 
 在隔离副本里故意取消分段重叠、改错排名公式、让 BM25 忽略段落长度，对应测试都按预期失败。
 
@@ -32,7 +32,7 @@ python3 -m kbeval explain Q07 --config fixed-200-0/bm25/3
 Support teams need to know whether search returns the policy text their agents need.\
 The tool compares document splitting and search methods on fictional support questions.\
 It shows which questions improve or regress, explains misses, and links results to the source text.\
-All 35 tests pass on the current version. Deliberate code changes triggered the expected test failures.\
+All 38 tests pass on the current version. Deliberate code changes triggered the expected test failures.\
 I set the requirements and acceptance criteria and directed AI coding tools to build it. No live model or real users were involved.
 
 ## 怎么运行
