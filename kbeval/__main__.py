@@ -85,6 +85,8 @@ def query_result(record: dict[str, str], ranked: Ranked, gold_ids: set[str], k: 
     if rank is None or rank > k:
         question = f"{record['question']} {expansion}" if expansion else record["question"]
         diagnosis = explain_miss(question, record["gold"], ranked, rank, k)
+        if expansion and rank is not None and rank > k + 1 and "ahead" not in diagnosis:
+            diagnosis["ahead"] = [chunk.id for chunk, _ in ranked[:rank - 1]]
     return {
         "rank": rank,
         "gold_chunks": sorted(gold_ids),
@@ -238,7 +240,7 @@ def compare_reports(left: dict, right: dict) -> None:
 def compare_configs(before_configs: dict, after_configs: dict, *, show_displacement: bool = False) -> None:
     better_count = worse_count = same_count = 0
     for name, before in before_configs.items():
-        k = ALL_CONFIGS[name][2]
+        chunking, retriever, k = ALL_CONFIGS[name]
         before, after = before["results"], after_configs[name]["results"]
         better, worse = [], []
         for qid in sorted(before):
@@ -257,11 +259,27 @@ def compare_configs(before_configs: dict, after_configs: dict, *, show_displacem
                   f"｜变坏 {len(worse)} 题：{', '.join(worse) or '无'}｜不变 {same} 题")
         if show_displacement:
             for qid in worse:
-                old_rank, new_rank = before[qid]["rank"], after[qid]["rank"]
+                new_result = after[qid]
+                old_rank, new_rank = before[qid]["rank"], new_result["rank"]
                 old_ahead = {hit["chunk"] for hit in before[qid]["top"][:old_rank - 1]}
-                new_ahead = after[qid]["top"][:new_rank - 1] if new_rank is not None else after[qid]["top"]
-                passed = [hit["chunk"] for hit in new_ahead if hit["chunk"] not in old_ahead]
-                print(f"  {qid}｜第 {old_rank} 名 → 第 {new_rank} 名｜新超过标准答案块：{', '.join(passed)}")
+                ahead_count = new_rank - 1 if new_rank is not None else len(new_result["top"])
+                new_ahead = []
+                # Cutoffs for the same chunking and retriever share a ranking.
+                for cutoff in CUTOFFS:
+                    if cutoff < k:
+                        continue
+                    result = after_configs[f"{chunking}/{retriever}/{cutoff}"]["results"][qid]
+                    if result["rank"] != new_rank:
+                        continue
+                    diagnosis = result.get("diagnosis") or {}
+                    ahead = diagnosis.get("ahead", [hit["chunk"] for hit in result["top"][:ahead_count]])
+                    if len(ahead) > len(new_ahead):
+                        new_ahead = ahead
+                    if len(new_ahead) >= ahead_count:
+                        break
+                passed = [chunk_id for chunk_id in new_ahead if chunk_id not in old_ahead]
+                warning = "（清单不完整，请用 eval --expand 重新生成报告）" if len(new_ahead) < ahead_count else ""
+                print(f"  {qid}｜第 {old_rank} 名 → 第 {new_rank} 名｜新超过标准答案块：{', '.join(passed)}{warning}")
     total = better_count + worse_count + same_count
     print(f"{len(before_configs)} 格，共 {total} 项逐题对比："
           f"变好 {better_count}，变坏 {worse_count}，不变 {same_count}。")
@@ -361,6 +379,11 @@ def main() -> None:
                 raise ValueError("扩展权重须在 0 到 1 之间，不含 1")
             synonyms = read_report(DATA / "kb" / "synonyms.json")
             held_out = load_questions(documents, DATA / "held_out.jsonl")
+            original_ids = {item["question"].strip(): item["id"] for item in questions}
+            for item in held_out:
+                original_id = original_ids.get(item["question"].strip())
+                if original_id is not None:
+                    raise ValueError(f"留出题 {item['id']} 与原有题 {original_id} 的问题重复")
             report = build_report(documents, questions, include_text=False, synonyms=synonyms,
                                   expansion_weight=weight, held_out=held_out)
         else:
