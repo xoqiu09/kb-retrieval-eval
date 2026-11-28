@@ -13,11 +13,17 @@ Ranked = list[tuple[Chunk, float]]
 
 def expand_query(question: str, synonyms: dict[str, list[str]]) -> str:
     question = question.lower()
-    return " ".join(
-        phrase for wording, phrases in synonyms.items()
-        if wording.lower() in question
-        for phrase in phrases
-    )
+    runs = set(_RUNS.findall(question))
+    expansion = []
+    for wording, phrases in synonyms.items():
+        key = wording.lower()
+        if wording.isascii() and wording.isalnum() and not (wording.isalpha() or wording.isdigit()):
+            matches = key in runs
+        else:
+            matches = key in question
+        if matches:
+            expansion.extend(phrases)
+    return " ".join(expansion)
 
 
 def _bigrams(run: str):
