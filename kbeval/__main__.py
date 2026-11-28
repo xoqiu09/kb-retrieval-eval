@@ -32,7 +32,7 @@ _EXPORT_LOCATION = re.compile(
 )
 _EXPORT_PRIVATE_TEXT = re.compile(
     r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}"
-    r"|(?<![0-9])1[3-9][0-9]{9}(?![0-9])"
+    r"|(?<![0-9])1[3-9][0-9](?:[0-9]{8}|-[0-9]{4}-[0-9]{4})(?![0-9])"
     r"|-----BEGIN .*PRIVATE KEY-----"
 )
 _SENTENCE_BLOCK_BREAK = re.compile(

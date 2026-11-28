@@ -34,6 +34,25 @@ class ExpansionScoringTests(unittest.TestCase):
         self.assertEqual(expand_query("支持 WI-FI 吗？", synonyms), "无线网络")
         self.assertEqual(expand_query("保修多久？", synonyms), "")
 
+        synonyms = {"E02": ["水箱没有装到位"], "refund": ["申请退款"]}
+        for question, expected in (
+            ("故障码e02？", "水箱没有装到位"),
+            ("故障码 E020？", ""),
+            ("故障码 AE02？", ""),
+            ("Refunds?", "申请退款"),
+        ):
+            with self.subTest(question=question):
+                self.assertEqual(expand_query(question, synonyms), expected)
+
+        documents = {"tank.md": "E02 表示水箱没有装到位。", "valve.md": "E020 表示阀门未就位。"}
+        questions = [{"id": "Q01", "question": "E020？", "gold": documents["valve.md"]}]
+        report = build_report(documents, questions, include_text=False, synonyms=synonyms)
+        for retriever in ("bm25", "bigram"):
+            for suffix in ("", EXPANDED_SUFFIX):
+                config = f"heading/{retriever}/1{suffix}"
+                with self.subTest(config=config):
+                    self.assertEqual(report["configs"][config]["results"]["Q01"]["rank"], 1)
+
     def test_expansion_applies_hand_calculated_weights(self):
         texts = {"a.md": "无线", "b.md": "联网", "c.md": "线网"}
         chunks = [Chunk(name, (), 0, len(text), text) for name, text in texts.items()]

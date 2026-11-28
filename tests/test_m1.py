@@ -309,6 +309,21 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(self.report["recommendation"]["config"], "heading/bigram/3")
         self.assertIn("仅适用于这组虚构数据", self.report["recommendation"]["reason"])
 
+        documents = {"a.md": "七天内可办理。", "b.md": "撤单请登记。", "c.md": "撤件请寄回。"}
+        questions = [
+            {"id": "Q01", "question": "申请还能撤回吗？", "gold": documents["a.md"]},
+            {"id": "Q02", "question": "几天内可办理？", "gold": documents["a.md"]},
+            {"id": "Q03", "question": "寄到哪？", "gold": documents["c.md"]},
+        ]
+        for order, records in (("forward", questions), ("reverse", questions[::-1])):
+            with self.subTest(order=order):
+                report = build_report(documents, records, include_text=False)
+                bm25 = report["configs"]["heading/bm25/3"]
+                bigram = report["configs"]["heading/bigram/3"]
+                self.assertEqual(bm25["mrr"], bigram["mrr"])
+                self.assertEqual(bm25["mrr"], 7 / 9)
+                self.assertEqual(report["recommendation"]["config"], "heading/bm25/3")
+
     def test_eval_is_byte_identical_after_rerun(self):
         second = self.directory / "report-again.json"
         cli("eval", "--out", str(second))
@@ -513,26 +528,32 @@ class CommandTests(unittest.TestCase):
                 self.assertEqual(stdout.getvalue(), "")
                 self.assertFalse(output.exists())
 
-    def test_export_rejects_email_before_writing(self):
-        data = self.directory / "email-in-corpus"
+    def test_export_rejects_private_text_before_writing(self):
+        data = self.directory / "private-text-in-corpus"
         shutil.copytree(ROOT / "data", data)
         doc = data / "kb" / "account.md"
-        with doc.open("a", encoding="utf-8") as stream:
-            stream.write("\n演示联系邮箱 demo@example.invalid。\n")
-        output = self.directory / "email-in-demo.json"
-        with (
-            patch("kbeval.__main__.DATA", data),
-            patch("sys.argv", ["kbeval", "export", "--out", str(output)]),
-            patch("sys.stdout", new_callable=StringIO) as stdout,
-            patch("sys.stderr", new_callable=StringIO) as stderr,
+        original = doc.read_text(encoding="utf-8")
+        for label, private_text in (
+            ("email", "demo@example.invalid"),
+            ("plain-phone", "13900000000"),
+            ("hyphenated-phone", "139-0000-0000"),
         ):
-            with self.assertRaises(SystemExit) as caught:
-                main()
-        self.assertEqual(caught.exception.code, 2)
-        self.assertIn("演示数据含有隐私信息", stderr.getvalue())
-        self.assertNotIn("demo@example.invalid", stderr.getvalue())
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertFalse(output.exists())
+            with self.subTest(value=label):
+                doc.write_text(f"{original}\n请联系{private_text}确认。\n", encoding="utf-8")
+                output = self.directory / f"private-text-in-demo-{label}.json"
+                with (
+                    patch("kbeval.__main__.DATA", data),
+                    patch("sys.argv", ["kbeval", "export", "--out", str(output)]),
+                    patch("sys.stdout", new_callable=StringIO) as stdout,
+                    patch("sys.stderr", new_callable=StringIO) as stderr,
+                ):
+                    with self.assertRaises(SystemExit) as caught:
+                        main()
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("演示数据含有隐私信息", stderr.getvalue())
+                self.assertNotIn(private_text, stderr.getvalue())
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertFalse(output.exists())
 
     def test_export_privacy_check_rejects_paths_and_phones_in_prose(self):
         for text in ("详见 `/tmp/demo.md`。", "请联系13900000000确认。"):
