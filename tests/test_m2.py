@@ -1,12 +1,18 @@
+from io import StringIO
 from math import fsum, log
 import json
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
+from kbeval.__main__ import CONFIGS, CUTOFFS, EXPANDED_SUFFIX, build_report, main
 from kbeval.chunk import Chunk
+from kbeval.metrics import reciprocal_rank
 from kbeval.retrieve import BM25, BigramOverlap, expand_query
 
 
@@ -101,6 +107,46 @@ class ExpansionCommandTests(unittest.TestCase):
         )
         self.assertIn("18 格，共 720 项逐题对比：变好 23，变坏 3，不变 694。", output)
 
+    def test_compare_lists_all_displacing_chunks_at_cutoff_one(self):
+        config = "heading/bigram/1"
+        gold = "归还物件。"
+        complete = "  Q01｜第 1 名 → 第 3 名｜新超过标准答案块：a.md:0-7, b.md:0-5"
+        incomplete = (
+            "  Q01｜第 1 名 → 第 7 名｜新超过标准答案块：a.md:0-7, b.md:0-5, d.md:0-5, e.md:0-5, f.md:0-5"
+            "（清单不完整，请用 eval --expand 重新生成报告）"
+        )
+        for question, legacy, extra_documents, expected in (
+            ("归还", False, "", complete),
+            ("咨询", False, "", complete),
+            ("咨询", True, "", complete),
+            ("咨询", True, "defg", incomplete),
+        ):
+            with self.subTest(question=question, legacy=legacy, extra_documents=extra_documents):
+                answer_document = gold if question == "归还" else f"{gold}咨询。"
+                documents = {"a.md": "配送预约签收。", "b.md": "配送预约。", "c.md": answer_document}
+                documents.update({f"{name}.md": documents["b.md"] for name in extra_documents})
+                report = build_report(
+                    documents, [{"id": "Q01", "question": question, "gold": gold}],
+                    include_text=False, synonyms={question: ["配送预约签收"]},
+                    held_out=[{"id": "H01", "question": "签收", "gold": documents["a.md"]}],
+                )
+                configs = report["configs"]
+                if legacy:
+                    # Older reports omitted "ahead" for the keyword-mismatch diagnosis.
+                    for cutoff in CUTOFFS:
+                        diagnosis = configs[f"heading/bigram/{cutoff}/expanded"]["results"]["Q01"]["diagnosis"]
+                        if diagnosis is not None:
+                            self.assertEqual(diagnosis["reason"], "关键词不重合")
+                            diagnosis.pop("ahead", None)
+                result = configs[f"{config}/expanded"]["results"]["Q01"]
+                self.assertEqual(len(result["top"]), 1)
+                path = self.directory / "displaced.json"
+                path.write_text(json.dumps(report), encoding="utf-8")
+
+                output = cli("compare", str(path)).splitlines()
+                row = f"{config}｜变好 0 题：无｜变坏 1 题：Q01｜不变 0 题"
+                self.assertEqual(output[output.index(row) + 1], expected)
+
     def test_compare_expansion_rejects_a_question_missing_from_both_configs(self):
         config = "heading/bigram/1"
         path = self.directory / "missing-question.json"
@@ -155,6 +201,62 @@ class ExpansionCommandTests(unittest.TestCase):
             "留出题（8 题）",
             "18 格，共 144 项逐题对比：变好 0，变坏 0，不变 144。",
         ])
+
+    def test_eval_rejects_an_original_question_in_held_out_data(self):
+        data = self.directory / "duplicate-data"
+        shutil.copytree(ROOT / "data", data)
+        questions = (data / "questions.jsonl").read_text(encoding="utf-8").splitlines()
+        original = next(item for item in map(json.loads, questions) if item["id"] == "Q34")
+        held_out = data / "held_out.jsonl"
+        records = [json.loads(line) for line in held_out.read_text(encoding="utf-8").splitlines()]
+        held_out_gold = next(item["gold"] for item in records if item["id"] == "H08")
+        self.assertNotEqual(original["gold"], held_out_gold)
+        output = self.directory / "duplicate-report.json"
+
+        for gold in (original["gold"], held_out_gold):
+            with self.subTest(same_gold=gold == original["gold"]):
+                duplicate = dict(original, id="H08", gold=gold)
+                updated = [duplicate if item["id"] == "H08" else item for item in records]
+                held_out.write_text("\n".join(map(json.dumps, updated)) + "\n", encoding="utf-8")
+                with (
+                    patch("kbeval.__main__.DATA", data),
+                    patch("kbeval.__main__.build_report", wraps=build_report) as score,
+                    patch("sys.argv", ["kbeval", "eval", "--expand", "--out", str(output)]),
+                    patch("sys.stdout", new_callable=StringIO),
+                    patch("sys.stderr", new_callable=StringIO) as stderr,
+                ):
+                    with self.assertRaises(SystemExit) as caught:
+                        main()
+                score.assert_not_called()
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("Q34", stderr.getvalue())
+                self.assertIn("H08", stderr.getvalue())
+                self.assertFalse(output.exists())
+
+    def test_readme_matches_test_count_and_expansion_results(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        count = unittest.TestLoader().discover(str(ROOT / "tests"), top_level_dir=str(ROOT)).countTestCases()
+        results = []
+        for label, dataset in (("原题", self.report), ("留出题", self.report["held_out"])):
+            configs = dataset["configs"]
+            changed = set()
+            for name, (_, _, k) in CONFIGS.items():
+                before = configs[name]["results"]
+                after = configs[f"{name}{EXPANDED_SUFFIX}"]["results"]
+                for qid in before:
+                    if reciprocal_rank(before[qid]["rank"], k) != reciprocal_rank(after[qid]["rank"], k):
+                        changed.add(qid)
+            results.append(f"{label} {len(changed)}/{len(dataset['questions'])}")
+
+        for pattern in (r"([0-9]+) 项全部通过", r"\bAll ([0-9]+) tests pass\b"):
+            with self.subTest(pattern=pattern):
+                declared = re.search(pattern, readme)
+                self.assertIsNotNone(declared)
+                self.assertEqual(int(declared.group(1)), count)
+
+        for expected in ("、".join(results), "原题上的收益可能偏乐观。"):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, readme, f"README 缺少：{expected}")
 
     def test_eval_uses_the_configured_expansion_weight(self):
         path = self.directory / "weighted.json"
