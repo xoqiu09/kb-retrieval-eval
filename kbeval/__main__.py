@@ -30,6 +30,11 @@ _EXPORT_LOCATION = re.compile(
     r"[^\s/\\])",
     re.IGNORECASE,
 )
+_EXPORT_PRIVATE_TEXT = re.compile(
+    r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}"
+    r"|(?<![0-9])1[3-9][0-9]{9}(?![0-9])"
+    r"|-----BEGIN .*PRIVATE KEY-----"
+)
 _SENTENCE_BLOCK_BREAK = re.compile(
     r"(?P<blank>\r?\n[ \t]*\r?\n)"
     r"|(?P<heading>^ {0,3}#{1,6}(?=[ \t]|\r?$)[^\r\n]*)"
@@ -37,9 +42,10 @@ _SENTENCE_BLOCK_BREAK = re.compile(
     r"|^(?P<indent> {0,3})(?:[-+*]|(?P<number>[0-9]{1,9})(?P<delimiter>[.)]))[ \t]+",
     re.MULTILINE,
 )
+_SENTENCE = re.compile(r"[^。！？!?]+[。！？!?]+")
 
 
-def _sentence_blocks(text: str) -> Iterator[str]:
+def _sentence_blocks(text: str) -> Iterator[tuple[int, int]]:
     start = 0
     fence = None
     ordered_list = None
@@ -66,11 +72,22 @@ def _sentence_blocks(text: str) -> Iterator[str]:
             continue
         ordered_list = list_kind
 
-        yield text[start:marker.start()]
+        yield start, marker.start()
         if marker["heading"]:
-            yield marker["heading"]
+            yield marker.span("heading")
         start = marker.end()
-    yield text[start:]
+    yield start, len(text)
+
+
+def _sentence_spans(documents: dict[str, str]) -> dict[str, dict[str, list[tuple[int, int]]]]:
+    spans = {}
+    for document, text in documents.items():
+        for start, end in _sentence_blocks(text):
+            for match in _SENTENCE.finditer(text, start, end):
+                sentence = match[0].strip()
+                span = (match.end() - len(sentence), match.end())
+                spans.setdefault(sentence, {}).setdefault(document, []).append(span)
+    return spans
 
 
 def load_data() -> tuple[dict[str, str], list[dict[str, str]]]:
@@ -82,12 +99,7 @@ def load_data() -> tuple[dict[str, str], list[dict[str, str]]]:
 
 
 def load_questions(documents: dict[str, str], path: Path) -> list[dict[str, str]]:
-    sentences = {
-        match.group().strip()
-        for text in documents.values()
-        for block in _sentence_blocks(text)
-        for match in re.finditer(r"[^。！？!?]+[。！？!?]+", block)
-    }
+    sentences = _sentence_spans(documents)
     questions = []
     seen = set()
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -150,6 +162,7 @@ def build_report(
     if held_out is not None:
         datasets.append((held_out, held_out_configs))
 
+    sentences = _sentence_spans(documents)
     chunk_index = {}
     for chunking in CHUNKINGS:
         chunks = make_chunks(documents, chunking)
@@ -160,7 +173,7 @@ def build_report(
 
         indexes = {name: index_type(chunks) for name, index_type in RETRIEVERS.items()}
         for records, dataset_configs in datasets:
-            matches = {item["id"]: gold_chunks(chunks, item["gold"]) for item in records}
+            matches = {item["id"]: gold_chunks(chunks, sentences.get(item["gold"], {})) for item in records}
             modes = {"": dict.fromkeys(matches, "")}
             if synonyms is not None:
                 modes[EXPANDED_SUFFIX] = {item["id"]: expand_query(item["question"], synonyms) for item in records}
@@ -229,6 +242,10 @@ def export_has_path(report: dict) -> bool:
         for value in json_strings(report)
         for match in _EXPORT_LOCATION.finditer(value)
     )
+
+
+def export_has_private_text(report: dict) -> bool:
+    return any(_EXPORT_PRIVATE_TEXT.search(value) for value in json_strings(report))
 
 
 def validate_result_ids(name: str, expected_ids: set[str], *results: dict) -> None:
@@ -349,7 +366,8 @@ def explain(documents: dict[str, str], record: dict[str, str], config: str) -> N
     chunks = make_chunks(documents, chunking)
     lookup = {chunk.id: chunk for chunk in chunks}
     ranked = RETRIEVERS[retriever](chunks).rank(record["question"])
-    result = query_result(record, ranked, gold_chunks(chunks, record["gold"]), k)
+    spans = _sentence_spans(documents).get(record["gold"], {})
+    result = query_result(record, ranked, gold_chunks(chunks, spans), k)
     print(f"{record['id']}｜{config}｜{record['question']}")
     print(f"标准原句：{record['gold']}")
     for pos, hit in enumerate(result["top"], 1):
@@ -409,9 +427,13 @@ def main() -> None:
             return
 
         export = args.command == "export"
-        # Keep the context of URLs split by fixed-width chunks.
-        if export and export_has_path({"documents": documents, "questions": questions}):
-            raise ValueError("演示数据含有本机绝对路径")
+        if export:
+            # Keep the context of URLs and private text split by fixed-width chunks.
+            sources = {"documents": documents, "filenames": list(documents), "questions": questions}
+            if export_has_path(sources):
+                raise ValueError("演示数据含有本机绝对路径")
+            if export_has_private_text(sources):
+                raise ValueError("演示数据含有隐私信息")
         if args.command == "eval" and args.expand:
             weight = DEFAULT_EXPANSION_WEIGHT if args.expansion_weight is None else args.expansion_weight
             if not 0 <= weight < 1:
@@ -420,6 +442,8 @@ def main() -> None:
             if not isinstance(synonyms, dict):
                 raise ValueError("同义词表应为 JSON 对象")
             for wording, phrases in synonyms.items():
+                if not wording.strip():
+                    raise ValueError("同义词条目名称为空")
                 if not isinstance(phrases, list) or not all(isinstance(phrase, str) for phrase in phrases):
                     raise ValueError(f"同义词条目“{wording}”的值应为文本列表")
             held_out = load_questions(documents, DATA / "held_out.jsonl")
