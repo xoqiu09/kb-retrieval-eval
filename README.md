@@ -8,7 +8,7 @@
 
 ## 怎么验证的
 
-运行 `python3 -m unittest`，40 项全部通过。测试用手算核对命中率和排名指标，也验证分段重叠能找回被切断的答案。
+运行 `python3 -m unittest`，47 项全部通过。测试用手算核对命中率和排名指标，也验证分段重叠能找回被切断的答案。
 
 在隔离副本里故意取消分段重叠、改错排名公式、让 BM25 忽略段落长度，对应测试都按预期失败。
 
@@ -32,7 +32,7 @@ python3 -m kbeval explain Q07 --config fixed-200-0/bm25/3
 Support teams need to know whether search returns the policy text their agents need.\
 The tool compares document splitting and search methods on fictional support questions.\
 It shows which questions improve or regress, explains misses, and links results to the source text.\
-All 40 tests pass on the current version. Deliberate code changes triggered the expected test failures.\
+All 47 tests pass on the current version. Deliberate code changes triggered the expected test failures.\
 I set the requirements and acceptance criteria and directed AI coding tools to build it. No live model or real users were involved.
 
 ## 怎么运行
@@ -56,6 +56,12 @@ python3 -m kbeval compare /tmp/kbeval-w19p1-a.json /tmp/kbeval-w19p1-b.json
 
 ```sh
 python3 -m kbeval explain Q07 --config fixed-200-50/bm25/3
+```
+
+解释扩展配置时，将报告中的 `expansion_weight` 传给 `--expansion-weight`，以复现原报告的排名。下面以权重 `0.2` 为例。
+
+```sh
+python3 -m kbeval explain Q34 --config fixed-200-50/bm25/3/expanded --expansion-weight 0.2
 ```
 
 导出网站演示页可用的数据。导出包含评测结果和虚构块原文，来源字段只写文档文件名，重复导出逐字节一致。
