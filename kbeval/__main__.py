@@ -1,8 +1,11 @@
 import argparse
 from collections.abc import Iterator
 import json
+import os
 from pathlib import Path
 import re
+from stat import S_IMODE, S_ISREG
+from uuid import uuid4
 
 from .chunk import Chunk, by_heading, fixed_width, gold_chunks
 from .diagnose import explain_miss
@@ -111,6 +114,9 @@ def load_questions(documents: dict[str, str], path: Path) -> list[dict[str, str]
             raise ValueError(f"题目为空：{qid}")
         if not isinstance(gold, str) or gold not in sentences:
             raise ValueError(f"语料中找不到标准原句：{qid}")
+        if len(sentences[gold]) > 1:
+            candidates = ", ".join(sorted(sentences[gold]))
+            raise ValueError(f"标准原句出现在多篇文档中：{qid}（{candidates}）。请改用能明确适用对象的标准原句")
         seen.add(qid)
         questions.append({"id": qid, "question": question, "gold": gold})
     if not questions:
@@ -226,6 +232,48 @@ def build_report(
 
 def read_report(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_report(output: Path, payload: bytes) -> None:
+    try:
+        mode = output.stat().st_mode
+    except FileNotFoundError:
+        # Check the original path before resolving anything through "..".
+        output.parent.stat()
+        if output.is_symlink():
+            output.write_bytes(payload)
+            return
+        mode = None
+    else:
+        if not S_ISREG(mode):
+            output.write_bytes(payload)
+            return
+        output = output.resolve(strict=True)
+        # Opening without truncation checks write access to the existing file.
+        os.close(os.open(output, os.O_WRONLY | getattr(os, "O_NONBLOCK", 0)))
+
+    temporary = output.with_name(f".kbeval-{uuid4().hex}.tmp")
+    stream = temporary.open("xb")
+    try:
+        with stream:
+            if mode is not None:
+                temporary.chmod(S_IMODE(mode))
+            stream.write(payload)
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_synonyms() -> dict[str, list[str]]:
+    synonyms = read_report(DATA / "kb" / "synonyms.json")
+    if not isinstance(synonyms, dict):
+        raise ValueError("同义词表应为 JSON 对象")
+    for wording, phrases in synonyms.items():
+        if not wording.strip():
+            raise ValueError("同义词条目名称为空")
+        if not isinstance(phrases, list) or not all(isinstance(phrase, str) for phrase in phrases):
+            raise ValueError(f"同义词条目“{wording}”的值应为文本列表")
+    return synonyms
 
 
 def json_strings(value):
@@ -372,13 +420,22 @@ def compare_expansion(report: dict) -> None:
         )
 
 
-def explain(documents: dict[str, str], record: dict[str, str], config: str) -> None:
-    chunking, retriever, k = CONFIGS[config]
+def explain(
+    documents: dict[str, str], record: dict[str, str], config: str, *,
+    expansion_weight: float = DEFAULT_EXPANSION_WEIGHT,
+) -> None:
+    chunking, retriever, k = ALL_CONFIGS[config]
     chunks = make_chunks(documents, chunking)
     lookup = {chunk.id: chunk for chunk in chunks}
-    ranked = RETRIEVERS[retriever](chunks).rank(record["question"])
+    expansion = expand_query(record["question"], load_synonyms()) if config.endswith(EXPANDED_SUFFIX) else ""
+    ranked = RETRIEVERS[retriever](chunks).rank(
+        record["question"], expansion=expansion, expansion_weight=expansion_weight,
+    )
     spans = _sentence_spans(documents).get(record["gold"], {})
-    result = query_result(record, ranked, gold_chunks(chunks, spans), k, retriever=retriever)
+    result = query_result(
+        record, ranked, gold_chunks(chunks, spans), k, retriever=retriever,
+        expansion=expansion if expansion_weight else "",
+    )
     print(f"{record['id']}｜{config}｜{record['question']}")
     print(f"标准原句：{record['gold']}")
     for pos, hit in enumerate(result["top"], 1):
@@ -418,7 +475,8 @@ def main() -> None:
     comparison.add_argument("b", type=Path, nargs="?")
     explanation = commands.add_parser("explain")
     explanation.add_argument("qid")
-    explanation.add_argument("--config", choices=tuple(CONFIGS), required=True)
+    explanation.add_argument("--config", choices=tuple(ALL_CONFIGS), required=True)
+    explanation.add_argument("--expansion-weight", type=float, help="扩展配置使用报告中的 expansion_weight，默认 0.5")
     args = parser.parse_args()
 
     try:
@@ -434,7 +492,14 @@ def main() -> None:
             record = next((record for record in questions if record["id"] == args.qid), None)
             if record is None:
                 raise ValueError(f"找不到题号：{args.qid}")
-            explain(documents, record, args.config)
+            weight = args.expansion_weight
+            if weight is None:
+                weight = DEFAULT_EXPANSION_WEIGHT
+            elif not args.config.endswith(EXPANDED_SUFFIX):
+                raise ValueError("设置扩展权重时须使用以 /expanded 结尾的配置")
+            elif not 0 <= weight < 1:
+                raise ValueError("扩展权重须在 0 到 1 之间，不含 1")
+            explain(documents, record, args.config, expansion_weight=weight)
             return
 
         export = args.command == "export"
@@ -449,14 +514,7 @@ def main() -> None:
             weight = DEFAULT_EXPANSION_WEIGHT if args.expansion_weight is None else args.expansion_weight
             if not 0 <= weight < 1:
                 raise ValueError("扩展权重须在 0 到 1 之间，不含 1")
-            synonyms = read_report(DATA / "kb" / "synonyms.json")
-            if not isinstance(synonyms, dict):
-                raise ValueError("同义词表应为 JSON 对象")
-            for wording, phrases in synonyms.items():
-                if not wording.strip():
-                    raise ValueError("同义词条目名称为空")
-                if not isinstance(phrases, list) or not all(isinstance(phrase, str) for phrase in phrases):
-                    raise ValueError(f"同义词条目“{wording}”的值应为文本列表")
+            synonyms = load_synonyms()
             held_out = load_questions(documents, DATA / "held_out.jsonl")
             original_ids = {item["question"].strip(): item["id"] for item in questions}
             for item in held_out:
@@ -469,7 +527,8 @@ def main() -> None:
             if args.command == "eval" and args.expansion_weight is not None:
                 raise ValueError("设置扩展权重时须同时使用 --expand")
             report = build_report(documents, questions, include_text=export)
-        args.out.write_bytes((json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        payload = (json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        write_report(args.out, payload)
         if export:
             print(f"已写出演示数据：{args.out}")
         else:

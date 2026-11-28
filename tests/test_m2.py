@@ -87,6 +87,48 @@ class ExpansionCommandTests(unittest.TestCase):
         cls.eval_output = cli("eval", "--expand", "--out", str(cls.path))
         cls.report = json.loads(cls.path.read_bytes())
 
+    def test_explain_accepts_the_recommended_expanded_config(self):
+        config = self.report["recommendation"]["config"]
+        self.assertTrue(config.endswith(EXPANDED_SUFFIX))
+        result = self.report["configs"][config]["results"]["Q34"]
+        self.assertEqual(result["rank"], 1)
+        hit = result["top"][0]
+        self.assertIn(hit["chunk"], result["gold_chunks"])
+        chunking = config.split("/", 1)[0]
+        source = self.report["chunks"][chunking][hit["chunk"]]
+
+        explained = subprocess.run(
+            [sys.executable, "-m", "kbeval", "explain", "Q34", "--config", config],
+            cwd=ROOT, capture_output=True, encoding="utf-8",
+        )
+        self.assertEqual(explained.returncode, 0, explained.stderr)
+        self.assertIn("首个含标准原句的块排第 1 名。", explained.stdout)
+        title = " / ".join(source["title_path"])
+        self.assertIn(
+            f"1. {source['document']} [{source['start']}, {source['end']})｜{title}"
+            f"｜得分 {hit['score']:.4f}｜含标准原句",
+            explained.stdout.splitlines(),
+        )
+
+    def test_explain_reproduces_the_reports_custom_expansion_weight(self):
+        path = self.directory / "custom-weight.json"
+        config = "fixed-200-50/bm25/3/expanded"
+        for weight, rank in ((0.2, 6), (0, 15)):
+            with self.subTest(weight=weight):
+                cli("eval", "--expand", "--expansion-weight", str(weight), "--out", str(path))
+                report = json.loads(path.read_bytes())
+                self.assertEqual(report["expansion_weight"], weight)
+                if weight:
+                    self.assertEqual(report["recommendation"]["config"], config)
+                result = report["configs"][config]["results"]["Q34"]
+                self.assertEqual(result["rank"], rank)
+
+                output = cli("explain", "Q34", "--config", config,
+                             "--expansion-weight", str(report["expansion_weight"]))
+                self.assertIn(f"首个含标准原句的块排第 {rank} 名。", output)
+                self.assertIn(f"归因：{result['diagnosis']['reason']}", output)
+                self.assertIn(f"得分 {result['top'][0]['score']:.4f}", output)
+
     def test_expansion_off_reproduces_all_m1_configs(self):
         path = self.directory / "m1.json"
         cli("eval", "--out", str(path))

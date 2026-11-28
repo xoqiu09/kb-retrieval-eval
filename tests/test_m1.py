@@ -1,8 +1,11 @@
-from io import StringIO
+from errno import ENOSPC
+from io import StringIO, open as open_file
 from math import log
 import json
+import os
 from pathlib import Path
 import shutil
+from stat import S_ISFIFO
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -254,6 +257,44 @@ class CommandTests(unittest.TestCase):
         self.assertIn("首个含标准原句的块排第 2 名。", stdout.getvalue())
         self.assertNotIn("命中前 1 名。", stdout.getvalue())
 
+    def test_eval_rejects_gold_sentence_shared_by_multiple_documents(self):
+        data = self.directory / "ambiguous-gold"
+        kb = data / "kb"
+        kb.mkdir(parents=True)
+        (kb / "a.md").write_text("# 配件退货\n整机退货请另查。配件申请期限如下。七天内。\n", encoding="utf-8")
+        (kb / "b.md").write_text("# 整机退货\n七天内。\n", encoding="utf-8")
+        record = {"id": "Q01", "question": "整机退货的申请期限？", "gold": "七天内。"}
+        questions = data / "questions.jsonl"
+        questions.write_text(json.dumps(record), encoding="utf-8")
+        output = data / "report.json"
+
+        with (
+            patch("kbeval.__main__.DATA", data),
+            patch("sys.argv", ["kbeval", "eval", "--out", str(output)]),
+            patch("sys.stdout", new_callable=StringIO),
+            patch("sys.stderr", new_callable=StringIO) as stderr,
+        ):
+            with patch("kbeval.__main__.build_report", wraps=build_report) as score:
+                with self.assertRaises(SystemExit) as caught:
+                    main()
+                score.assert_not_called()
+            self.assertEqual(caught.exception.code, 2)
+            for expected in ("Q01", "a.md", "b.md"):
+                self.assertIn(expected, stderr.getvalue())
+            self.assertFalse(output.exists())
+
+            record["gold"] = "整机退货须在七天内申请。"
+            (kb / "b.md").write_text(f"# 整机退货\n{record['gold']}\n", encoding="utf-8")
+            questions.write_text(json.dumps(record), encoding="utf-8")
+            main()
+
+        row = json.loads(output.read_bytes())["configs"]["heading/bigram/1"]
+        result = row["results"]["Q01"]
+        self.assertEqual(result["gold_chunks"], ["b.md:0-20"])
+        self.assertEqual(result["top"][0]["chunk"], "a.md:0-29")
+        self.assertEqual(result["rank"], 2)
+        self.assertEqual(row["recall"], 0)
+
     def test_eval_matrix_and_gold_are_independent_of_retriever(self):
         documents, questions = load_data()
         gold = "云端日志仅保留七天。"
@@ -328,6 +369,94 @@ class CommandTests(unittest.TestCase):
         second = self.directory / "report-again.json"
         cli("eval", "--out", str(second))
         self.assertEqual(self.baseline.read_bytes(), second.read_bytes())
+
+    def test_eval_rejects_missing_path_component_before_parent_reference(self):
+        output = self.directory / "keep-report.json"
+        original = b'{"previous": true}\n'
+        output.write_bytes(original)
+        invalid_output = self.directory / "missing" / ".." / output.name
+
+        completed = subprocess.run(
+            [sys.executable, "-m", "kbeval", "eval", "--out", str(invalid_output)],
+            cwd=ROOT, capture_output=True, encoding="utf-8",
+        )
+
+        self.assertEqual(output.read_bytes(), original)
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("missing", completed.stderr)
+        self.assertEqual(completed.stdout, "")
+
+    def test_eval_preserves_read_only_report(self):
+        output = self.directory / "read-only.json"
+        original = b'{"previous": true}\n'
+        output.write_bytes(original)
+        output.chmod(0o444)
+        if os.access(output, os.W_OK):
+            self.skipTest("当前用户可以写入只读文件")
+
+        completed = subprocess.run(
+            [sys.executable, "-m", "kbeval", "eval", "--out", str(output)],
+            cwd=ROOT, capture_output=True, encoding="utf-8",
+        )
+
+        self.assertEqual(output.read_bytes(), original)
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn(output.name, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "当前平台不支持命名管道")
+    def test_eval_streams_output_to_existing_fifo(self):
+        output = self.directory / "report.pipe"
+        os.mkfifo(output)
+        report = {"configs": {}, "recommendation": {"config": "example", "reason": "示例"}}
+        # Keep a reader open. The small report fits in the pipe buffer.
+        reader = os.open(output, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            with (
+                patch("kbeval.__main__.build_report", return_value=report),
+                patch("sys.argv", ["kbeval", "eval", "--out", str(output)]),
+                patch("sys.stdout", new_callable=StringIO),
+            ):
+                main()
+
+            self.assertTrue(S_ISFIFO(output.stat().st_mode))
+            self.assertEqual(json.loads(os.read(reader, 4096)), report)
+        finally:
+            os.close(reader)
+
+    def test_eval_keeps_previous_report_when_disk_fills_during_write(self):
+        output = self.directory / "disk-full.json"
+        previous_report = self.baseline.read_bytes()
+        output.write_bytes(previous_report)
+        previous_files = set(self.directory.iterdir())
+
+        def open_with_full_disk(file, mode, *args, **kwargs):
+            stream = open_file(file, mode, *args, **kwargs)
+            if mode in ("wb", "xb"):
+                write = stream.write
+
+                def fail_after_partial_write(payload):
+                    self.assertEqual(write(payload[:32]), 32)
+                    raise OSError(ENOSPC, "No space left on device")
+
+                stream.write = fail_after_partial_write
+            return stream
+
+        with (
+            patch("io.open", open_with_full_disk),
+            patch("sys.argv", ["kbeval", "eval", "--out", str(output)]),
+            patch("sys.stdout", new_callable=StringIO) as stdout,
+            patch("sys.stderr", new_callable=StringIO) as stderr,
+        ):
+            with self.assertRaises(SystemExit) as caught:
+                main()
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("No space left on device", stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(output.stat().st_size, len(previous_report))
+        self.assertEqual(output.read_bytes(), previous_report)
+        self.assertEqual(set(self.directory.iterdir()), previous_files)
 
     def test_compare_reports_changes_and_counts(self):
         left = self.directory / "before.json"
