@@ -30,7 +30,7 @@ python3 -m kbeval explain Q07 --config fixed-200-0/bm25/3
 Support teams need to know whether search returns the policy text their agents need.\
 The tool compares document splitting and search methods on fictional support questions.\
 It shows which questions improve or regress, explains misses, and links results to the source text.\
-All 14 tests passed on the public version. Deliberate code changes triggered the expected test failures.\
+All 29 tests pass on the current version. Deliberate code changes triggered the expected test failures.\
 I set the requirements and acceptance criteria and directed AI coding tools to build it. No live model or real users were involved.
 
 ## 怎么运行
