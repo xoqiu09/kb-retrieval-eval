@@ -174,6 +174,59 @@ class CommandTests(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, "标准原句：Q34"):
                             load_data()
 
+    def test_load_data_preserves_sentence_continuations_that_look_like_list_markers(self):
+        data = self.directory / "literal-list-markers"
+        shutil.copytree(ROOT / "data", data)
+        doc = data / "kb" / "account.md"
+        original = doc.read_text(encoding="utf-8")
+        questions_file = data / "questions.jsonl"
+        questions = [json.loads(line) for line in questions_file.read_text(encoding="utf-8").splitlines()]
+        question = next(item for item in questions if item["id"] == "Q34")
+        original_gold = question["gold"]
+        error_message = "设备屏幕提示\n404. 找不到该设备。"
+        formula = "剩余天数 = 7\n- 已过天数。"
+        for replacement, full, partial in (
+            (error_message, error_message, "找不到该设备。"),
+            (f"```text\n计算方法。\n{formula}\n```\n\n", formula, "已过天数。"),
+        ):
+            doc.write_text(original.replace(original_gold, replacement, 1), encoding="utf-8")
+            for gold in (full, partial):
+                with self.subTest(gold=gold):
+                    question["gold"] = gold
+                    questions_file.write_text("\n".join(map(json.dumps, questions)), encoding="utf-8")
+                    with patch("kbeval.__main__.DATA", data):
+                        if gold == full:
+                            documents, loaded = load_data()
+                            self.assertIn(question, loaded)
+                            self.assertTrue(gold_chunks(make_chunks(documents, "heading"), gold))
+                        else:
+                            with self.assertRaisesRegex(ValueError, "标准原句：Q34"):
+                                load_data()
+
+    def test_eval_finds_gold_sentence_at_its_source_range_in_a_list_item(self):
+        data = self.directory / "list-item-gold"
+        shutil.copytree(ROOT / "data", data)
+        doc = data / "kb" / "account.md"
+        original = doc.read_bytes().decode("utf-8")
+        gold = "云端日志仅保留七天。"
+        output = self.directory / "list-item-gold.json"
+        argv = ["kbeval", "eval", "--out", str(output)]
+
+        for marker in ("", "- ", "  1. ", "  2. ", "注意事项\n  1. ", "  1. 另一项。\n  2. "):
+            with self.subTest(marker=marker):
+                text = original.replace(gold, marker + gold, 1)
+                doc.write_bytes(text.encode("utf-8"))
+                with patch("kbeval.__main__.DATA", data), patch("sys.argv", argv):
+                    with patch("sys.stdout", new_callable=StringIO):
+                        main()
+                report = json.loads(output.read_bytes())
+                self.assertEqual(next(item["gold"] for item in report["questions"] if item["id"] == "Q34"), gold)
+                result = report["configs"]["heading/bigram/1"]["results"]["Q34"]
+                start, end = text.index("## 运行记录"), len(text)
+                self.assertEqual(result["gold_chunks"], [f"account.md:{start}-{end}"])
+                source = report["chunks"]["heading"][result["gold_chunks"][0]]
+                self.assertIn(marker + gold, text[source["start"]:source["end"]])
+
     def test_eval_matrix_and_gold_are_independent_of_retriever(self):
         documents, questions = load_data()
         self.assertEqual(len(documents), 6)
