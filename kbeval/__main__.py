@@ -1,4 +1,5 @@
 import argparse
+from collections.abc import Iterator
 import json
 from pathlib import Path
 import re
@@ -30,8 +31,46 @@ _EXPORT_LOCATION = re.compile(
     re.IGNORECASE,
 )
 _SENTENCE_BLOCK_BREAK = re.compile(
-    r"(\r?\n[ \t]*\r?\n|^ {0,3}#{1,6}(?=[ \t]|\r?$)[^\r\n]*)", re.MULTILINE,
+    r"(?P<blank>\r?\n[ \t]*\r?\n)"
+    r"|(?P<heading>^ {0,3}#{1,6}(?=[ \t]|\r?$)[^\r\n]*)"
+    r"|^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>[^\r\n]*)"
+    r"|^(?P<indent> {0,3})(?:[-+*]|(?P<number>[0-9]{1,9})(?P<delimiter>[.)]))[ \t]+",
+    re.MULTILINE,
 )
+
+
+def _sentence_blocks(text: str) -> Iterator[str]:
+    start = 0
+    fence = None
+    ordered_list = None
+    for marker in _SENTENCE_BLOCK_BREAK.finditer(text):
+        fence_marker = marker["fence"]
+        if fence_marker:
+            info = marker["info"]
+            if fence is not None:
+                if not fence_marker.startswith(fence) or info.strip(" \t"):
+                    continue
+                fence = None
+            elif fence_marker[0] == "~" or "`" not in info:
+                fence = fence_marker
+            else:
+                continue
+        elif fence is not None and not marker["blank"]:
+            continue
+
+        number = marker["number"]
+        list_kind = (marker["indent"], marker["delimiter"]) if number else None
+        # A new ordered list can interrupt a paragraph only if it starts at 1.
+        if (number and int(number) != 1 and list_kind != ordered_list
+                and text[start:marker.start()].strip()):
+            continue
+        ordered_list = list_kind
+
+        yield text[start:marker.start()]
+        if marker["heading"]:
+            yield marker["heading"]
+        start = marker.end()
+    yield text[start:]
 
 
 def load_data() -> tuple[dict[str, str], list[dict[str, str]]]:
@@ -46,7 +85,7 @@ def load_questions(documents: dict[str, str], path: Path) -> list[dict[str, str]
     sentences = {
         match.group().strip()
         for text in documents.values()
-        for block in _SENTENCE_BLOCK_BREAK.split(text)
+        for block in _sentence_blocks(text)
         for match in re.finditer(r"[^。！？!?]+[。！？!?]+", block)
     }
     questions = []
@@ -378,6 +417,11 @@ def main() -> None:
             if not 0 <= weight < 1:
                 raise ValueError("扩展权重须在 0 到 1 之间，不含 1")
             synonyms = read_report(DATA / "kb" / "synonyms.json")
+            if not isinstance(synonyms, dict):
+                raise ValueError("同义词表应为 JSON 对象")
+            for wording, phrases in synonyms.items():
+                if not isinstance(phrases, list) or not all(isinstance(phrase, str) for phrase in phrases):
+                    raise ValueError(f"同义词条目“{wording}”的值应为文本列表")
             held_out = load_questions(documents, DATA / "held_out.jsonl")
             original_ids = {item["question"].strip(): item["id"] for item in questions}
             for item in held_out:

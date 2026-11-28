@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import re
 import shutil
+from shutil import copytree
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -11,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from kbeval.__main__ import CONFIGS, CUTOFFS, EXPANDED_SUFFIX, build_report, main
+from kbeval.__main__ import main
 from kbeval.chunk import Chunk
 from kbeval.metrics import reciprocal_rank
 from kbeval.retrieve import BM25, BigramOverlap, expand_query
@@ -267,3 +269,23 @@ class ExpansionCommandTests(unittest.TestCase):
         q34 = report["configs"]["heading/bigram/1/expanded"]["results"]["Q34"]
         self.assertEqual(q34["top"][0]["chunk"], "account.md:290-374")
         self.assertAlmostEqual(q34["top"][0]["score"], 1.2)
+
+    def test_eval_rejects_synonyms_that_are_not_lists_of_strings(self):
+        data = self.directory / "invalid-synonyms"
+        copytree(ROOT / "data", data)
+        synonyms_path = data / "kb" / "synonyms.json"
+        synonyms = json.loads(synonyms_path.read_bytes())
+        output = self.directory / "invalid-synonyms.json"
+        argv = ["kbeval", "eval", "--expand", "--out", str(output)]
+
+        for invalid in ("云端日志", ["云端日志", 7]):
+            with self.subTest(value=invalid):
+                synonyms["遥测档案"] = invalid
+                synonyms_path.write_text(json.dumps(synonyms, ensure_ascii=False), encoding="utf-8")
+                with patch("kbeval.__main__.DATA", data), patch("sys.argv", argv):
+                    with patch("sys.stdout", new_callable=StringIO), patch("sys.stderr", new_callable=StringIO) as stderr:
+                        with self.assertRaises(SystemExit) as caught:
+                            main()
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("同义词条目“遥测档案”的值应为文本列表", stderr.getvalue())
+                self.assertFalse(output.exists())
